@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -34,10 +35,10 @@ func udpAddr(addr string) *net.UDPAddr {
 func Enc(enc chan []byte, writePacket func([]byte, bool), config Config, encoders []reedsolomon.Encoder) {
 	group := udpfecgo.PacketGroup{Id: rand.Uint32()}
 
-	t := make(chan bool)
 	var (
 		is_final bool
-		deadline time.Time
+		ctx      context.Context = context.Background()
+		cancel   context.CancelFunc
 	)
 
 	for {
@@ -49,7 +50,15 @@ func Enc(enc chan []byte, writePacket func([]byte, bool), config Config, encoder
 			writePacket(b, false)
 
 			is_final = len(group.Shards) == len(config.Fec)
-		case is_final = <-t:
+		case <-ctx.Done():
+			cancel()
+			ctx = context.Background()
+
+			is_final = true
+		}
+
+		if len(group.Shards) == 0 {
+			continue
 		}
 
 		if is_final {
@@ -61,17 +70,11 @@ func Enc(enc chan []byte, writePacket func([]byte, bool), config Config, encoder
 			}
 
 			group = udpfecgo.PacketGroup{Id: rand.Uint32()}
-			deadline = time.Time{}
+
+			cancel()
+			ctx = context.Background()
 		} else {
-			deadline = time.Now().Add(time.Duration(config.Timeout) * time.Millisecond)
-
-			go func() {
-				time.Sleep(time.Duration(config.Timeout) * time.Millisecond)
-
-				if !deadline.IsZero() && time.Now().After(deadline) {
-					t <- true
-				}
-			}()
+			ctx, cancel = context.WithTimeout(context.Background(), time.Duration(config.Timeout)*time.Millisecond)
 		}
 	}
 }
@@ -81,14 +84,20 @@ func Dec(dec chan []byte, writePacket func([]byte, bool), config Config, encoder
 
 	// GC
 	go func() {
-		now := time.Now()
+		for {
+			now := time.Now()
+			u := time.Time{}
 
-		for i := range groups {
-			if !groups[i].LastActive.IsZero() {
-				if groups[i].LastActive.Add(time.Duration(config.GroupLive) * time.Millisecond).After(now) {
-					delete(groups, i)
+			for i := range groups {
+				if groups[i].LastActive != u {
+					if groups[i].LastActive.Add(time.Duration(config.GroupLive) * time.Millisecond).Before(now) {
+						//fmt.Printf("GC: group %x cleared\n", i)
+						delete(groups, i)
+					}
 				}
 			}
+
+			time.Sleep(time.Second)
 		}
 	}()
 
@@ -101,7 +110,7 @@ func Dec(dec chan []byte, writePacket func([]byte, bool), config Config, encoder
 			continue
 		}
 
-		fmt.Printf("id: %x\n", id)
+		// fmt.Printf("id: %x\n", id)
 
 		if _, ok := groups[id]; !ok {
 			groups[id] = &udpfecgo.PacketGroup{}
@@ -122,6 +131,7 @@ func Dec(dec chan []byte, writePacket func([]byte, bool), config Config, encoder
 
 		if b != nil {
 			writePacket(b, true)
+			continue
 		}
 
 		if group.Content_n != 0 {
@@ -135,14 +145,11 @@ func Dec(dec chan []byte, writePacket func([]byte, bool), config Config, encoder
 			if data, err := group.Reconstruct(encoders[group.Content_n-1]); err == nil {
 				fmt.Printf("reconstructed group %x\n", id)
 				for i := range data {
-					if !group.Sent[i] {
+					if i >= len(group.Sent) || !group.Sent[i] {
 						writePacket(data[i], true)
 					}
 				}
 				group.Finished = true
-			} else if err != reedsolomon.ErrTooFewShards {
-				group.Finished = true
-				fmt.Printf("finished: %s\n", err)
 			} else {
 				fmt.Printf("%s\n", err)
 			}

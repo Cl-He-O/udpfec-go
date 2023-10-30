@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
@@ -18,6 +19,7 @@ type PacketGroup struct {
 	Content_n uint16
 	Content_m uint16
 	Parity_n  uint16 // config
+	Parity_m  uint16
 	Parity_l  uint16
 
 	LastActive time.Time
@@ -33,28 +35,36 @@ func (s *PacketGroup) EncodePacket(i int) []byte {
 	header = binary.BigEndian.AppendUint32(header, s.Id)
 	header = binary.BigEndian.AppendUint16(header, uint16(i))
 
+	//fmt.Printf("i: %d, data: %x\n", i, s.Shards[i])
+
 	return append(header, s.Shards[i]...)
 }
 
-func pad(data [][]byte) int {
-	l := 0
+func pad(data [][]byte, target uint16) uint16 {
+	if target == 0 {
+		for i := range data {
+			if uint16(len(data[i])) > target {
+				target = uint16(len(data[i]))
+			}
+		}
+
+		target += 2
+	}
 
 	for i := range data {
-		if len(data[i]) > l {
-			l = len(data[i])
+		if data[i] != nil {
+			l := uint16(len(data[i]))
+			data[i] = append(data[i], make([]byte, target-uint16(len(data[i])))...)
+			binary.BigEndian.PutUint16(data[i][target-2:], l)
 		}
 	}
 
-	for i := range data {
-		data[i] = append(data[i], make([]byte, l-len(data[i]))...)
-	}
-
-	return l
+	return target
 }
 
 func (s *PacketGroup) Final(encoder reedsolomon.Encoder) [][]byte {
 	content_n := len(s.Shards)
-	parity_len := pad(s.Shards)
+	parity_len := pad(s.Shards, 0)
 
 	s.Shards = append(s.Shards, make([][]byte, s.Parity_n)...)
 	for i := content_n; i < len(s.Shards); i++ {
@@ -102,7 +112,11 @@ func (s *PacketGroup) DecodePacket(b []byte, fec []int, max_total_n uint16) ([]b
 		binary.Read(r, binary.BigEndian, &content_n)
 	}
 
-	if s.Content_n == 0 && is_parity {
+	if is_parity {
+		if s.Content_n != 0 && content_n != s.Content_n {
+			return nil, fmt.Errorf("mismatch content shard number: %d != %d", content_n, s.Content_n)
+		}
+
 		if content_n > max_total_n {
 			return nil, fmt.Errorf("too many content shards: %d >= %d", content_n, max_total_n)
 		}
@@ -118,53 +132,54 @@ func (s *PacketGroup) DecodePacket(b []byte, fec []int, max_total_n uint16) ([]b
 		return nil, fmt.Errorf("packet index out of bound: %d >= %d", i, max_total_n)
 	}
 
-	if !is_parity {
-		s.Content_m += 1
-	}
-
 	if int(i)+1 > len(s.Shards) {
 		s.Shards = append(s.Shards, make([][]byte, int(i)+1-len(s.Shards))...)
-		s.Sent = append(s.Sent, make([]bool, int(i)+1-len(s.Sent))...)
 	}
 	s.Shards[i] = make([]byte, r.Len())
 	r.Read(s.Shards[i])
-	s.Sent[i] = true
 
-	fmt.Printf("i: %d\n", i)
+	//fmt.Printf("i: %d\n", i)
 
 	if !is_parity {
+		s.Content_m += 1
+		if int(i)+1 > len(s.Sent) {
+			s.Sent = append(s.Sent, make([]bool, int(i)+1-len(s.Sent))...)
+		}
 		return s.Shards[i], nil
 	} else {
+		s.Parity_m += 1
 		s.Parity_l = uint16(len(s.Shards[i]))
 		return nil, nil
 	}
 }
 
 func (s *PacketGroup) Reconstruct(encoder reedsolomon.Encoder) ([][]byte, error) {
+	if s.Content_m+s.Parity_m < s.Content_n {
+		return nil, fmt.Errorf("")
+	}
+
 	s.Shards = append(s.Shards, make([][]byte, s.Parity_n+s.Content_n-uint16(len(s.Shards)))...)
+
+	pad(s.Shards[:s.Content_n], s.Parity_l)
 
 	err := encoder.ReconstructData(s.Shards)
 
 	if err != nil {
-		if err == reedsolomon.ErrShardSize {
-			l := make([]uint16, len(s.Shards))
+		return nil, err
+	}
 
-			for i := range s.Shards[:s.Content_n] {
-				if s.Shards[i] != nil {
-					l[i] = uint16(len(s.Shards[i]))
-					s.Shards[i] = append(s.Shards[i], make([]byte, s.Parity_l-uint16(len(s.Shards[i])))...)
-				}
-			}
+	var (
+		r io.Reader
+		l uint16
+	)
 
-			err := encoder.ReconstructData(s.Shards)
-			if err != nil {
-				fmt.Printf("failed\n")
-				return nil, err
-			}
+	for i := range s.Shards[:s.Content_n] {
+		r = bytes.NewReader(s.Shards[i][len(s.Shards[i])-2:])
 
-		} else {
-			return nil, err
-		}
+		binary.Read(r, binary.BigEndian, &l)
+		s.Shards[i] = s.Shards[i][:l]
+
+		//fmt.Printf("i: %d, data: %x\n", i, s.Shards[i])
 	}
 
 	return s.Shards[:s.Content_n], nil

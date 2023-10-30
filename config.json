@@ -2,13 +2,15 @@
   "is_server": false,
   "listen": "127.0.0.1:12222",
   "forward": "127.0.0.1:12223",
-  "timeout": 10,
+  "timeout": 100,
+  "group_live": 10000,
   "fec": [
     1,
-    1,
     2,
     2,
-    2,
-    3
+    3,
+    3,
+    3,
+    4
   ]
 }
