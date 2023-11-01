@@ -10,17 +10,16 @@ import (
 	"os"
 	"time"
 
-	udpfecgo "github.com/Cl-He-O/udpfec-go/v2"
 	"github.com/klauspost/reedsolomon"
 )
 
 type Config struct {
-	Listen    string `json:"listen"`
-	Forward   string `json:"forward"`
-	IsServer  bool   `json:"is_server"`
-	Timeout   int    `json:"timeout"`
-	GroupLive int    `json:"group_live"`
-	Fec       []int  `json:"fec"`
+	Listen    string   `json:"listen"`
+	Forward   string   `json:"forward"`
+	IsServer  bool     `json:"is_server"`
+	Timeout   int      `json:"timeout"`
+	GroupLive int      `json:"group_live"`
+	Fec       []uint16 `json:"fec"`
 }
 
 func udpAddr(addr string) *net.UDPAddr {
@@ -32,10 +31,11 @@ func udpAddr(addr string) *net.UDPAddr {
 	return udpaddr
 }
 
-func Enc(enc chan []byte, writePacket func([]byte, bool), config Config, encoders []reedsolomon.Encoder) {
-	group := udpfecgo.PacketGroup{Id: rand.Uint32()}
+func encode(enc chan []byte, write_packet func([]byte, bool), config Config, encoders []reedsolomon.Encoder) {
 
 	var (
+		shards   [][]byte = make([][]byte, 0)
+		id       uint32   = rand.Uint32()
 		is_final bool
 		ctx      context.Context = context.Background()
 		cancel   context.CancelFunc
@@ -44,12 +44,12 @@ func Enc(enc chan []byte, writePacket func([]byte, bool), config Config, encoder
 	for {
 		select {
 		case b := <-enc:
-			group.Shards = append(group.Shards, b)
-			b = group.EncodePacket(len(group.Shards) - 1)
+			shards = append(shards, b)
+			b = encode_packet(shards, id, len(shards)-1)
 
-			writePacket(b, false)
+			write_packet(b, false)
 
-			is_final = len(group.Shards) == len(config.Fec)
+			is_final = len(shards) == len(config.Fec)
 		case <-ctx.Done():
 			cancel()
 			ctx = context.Background()
@@ -57,30 +57,26 @@ func Enc(enc chan []byte, writePacket func([]byte, bool), config Config, encoder
 			is_final = true
 		}
 
-		if len(group.Shards) == 0 {
-			continue
-		}
-
 		if is_final {
-			group.Parity_n = uint16(config.Fec[len(group.Shards)-1])
-			parity := group.Final(encoders[len(group.Shards)-1])
+			parity := final(shards, id, config.Fec[len(shards)-1], encoders[len(shards)-1])
 
 			for i := range parity {
-				writePacket(parity[i], false)
+				write_packet(parity[i], false)
 			}
 
-			group = udpfecgo.PacketGroup{Id: rand.Uint32()}
+			shards = make([][]byte, 0)
+			id = rand.Uint32()
 
 			cancel()
 			ctx = context.Background()
-		} else {
+		} else if len(shards) == 1 {
 			ctx, cancel = context.WithTimeout(context.Background(), time.Duration(config.Timeout)*time.Millisecond)
 		}
 	}
 }
 
-func Dec(dec chan []byte, writePacket func([]byte, bool), config Config, encoders []reedsolomon.Encoder) {
-	groups := make(map[uint32]*udpfecgo.PacketGroup)
+func decode(dec chan []byte, write_packet func([]byte, bool), config Config, encoders []reedsolomon.Encoder) {
+	groups := make(map[uint32]*dec_group)
 
 	// GC
 	go func() {
@@ -89,8 +85,8 @@ func Dec(dec chan []byte, writePacket func([]byte, bool), config Config, encoder
 			u := time.Time{}
 
 			for i := range groups {
-				if groups[i].LastActive != u {
-					if groups[i].LastActive.Add(time.Duration(config.GroupLive) * time.Millisecond).Before(now) {
+				if groups[i].last_active != u {
+					if groups[i].last_active.Add(time.Duration(config.GroupLive) * time.Millisecond).Before(now) {
 						//fmt.Printf("GC: group %x cleared\n", i)
 						delete(groups, i)
 					}
@@ -104,7 +100,7 @@ func Dec(dec chan []byte, writePacket func([]byte, bool), config Config, encoder
 	for {
 		b := <-dec
 
-		id, err := udpfecgo.ReadID(b)
+		id, err := read_id(b)
 		if err != nil {
 			fmt.Printf("%s\n", err)
 			continue
@@ -113,43 +109,42 @@ func Dec(dec chan []byte, writePacket func([]byte, bool), config Config, encoder
 		// fmt.Printf("id: %x\n", id)
 
 		if _, ok := groups[id]; !ok {
-			groups[id] = &udpfecgo.PacketGroup{}
+			groups[id] = &dec_group{}
 		}
 		group := groups[id]
 
-		if group.Finished {
+		if group.finished {
 			continue
 		}
 
-		b, err = group.DecodePacket(b, config.Fec, 256)
+		b, err = group.decode_packet(b, config.Fec)
 		if err != nil {
 			fmt.Printf("%s\n", err)
 			continue
 		}
 
-		group.LastActive = time.Now()
+		group.last_active = time.Now()
 
 		if b != nil {
-			writePacket(b, true)
+			write_packet(b, true)
 			continue
 		}
 
-		if group.Content_n != 0 {
-			if group.Content_m == group.Content_n {
+		if group.content_n != 0 {
+			if group.content_m == group.content_n {
 				fmt.Printf("finished group %x\n", id)
-				group.Finished = true
+				group.finished = true
 				continue
 			}
 
-			group.Parity_n = uint16(config.Fec[group.Content_n-1])
-			if data, err := group.Reconstruct(encoders[group.Content_n-1]); err == nil {
+			if data, err := group.reconstruct(config.Fec[group.content_n-1], encoders[group.content_n-1]); err == nil {
 				fmt.Printf("reconstructed group %x\n", id)
 				for i := range data {
-					if i >= len(group.Sent) || !group.Sent[i] {
-						writePacket(data[i], true)
+					if i >= len(group.sent) || !group.sent[i] {
+						write_packet(data[i], true)
 					}
 				}
-				group.Finished = true
+				group.finished = true
 			} else {
 				fmt.Printf("%s\n", err)
 			}
@@ -178,7 +173,7 @@ func main() {
 
 	encoders := make([]reedsolomon.Encoder, len(config.Fec))
 	for i := range encoders {
-		encoders[i], err = reedsolomon.New(i+1, config.Fec[i])
+		encoders[i], err = reedsolomon.New(i+1, int(config.Fec[i]))
 		if err != nil {
 			panic(err)
 		}
@@ -204,21 +199,20 @@ func main() {
 	}
 	go func() {
 		for {
-			buf := make([]byte, udpfecgo.BufSize)
+			buf := make([]byte, BufSize)
 
 			n, _, err := forward.ReadFromUDPAddrPort(buf)
 
 			if err != nil {
 				fmt.Printf("%s\n", err)
-				next = nil
-				return
+				continue
 			}
 
 			next <- buf[:n]
 		}
 	}()
 
-	writePacket := func(b []byte, isDec bool) {
+	write_packet := func(b []byte, isDec bool) {
 		go func() {
 			if config.IsServer == isDec {
 				_, err := forward.Write(b)
@@ -234,15 +228,15 @@ func main() {
 		}()
 	}
 
-	go Enc(enc, writePacket, config, encoders)
-	go Dec(dec, writePacket, config, encoders)
+	go encode(enc, write_packet, config, encoders)
+	go decode(dec, write_packet, config, encoders)
 
 	var (
 		n int
 	)
 
 	for {
-		b := make([]byte, udpfecgo.BufSize)
+		b := make([]byte, BufSize)
 		n, from, err = listen.ReadFromUDPAddrPort(b)
 
 		if err != nil {
