@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	BufSize int = 9000
+	buf_size int = 9000
 )
 
 func extend[T any](b []T, l int) []T {
@@ -76,20 +76,20 @@ func final(shards [][]byte, id uint32, parity_n uint16, encoder reedsolomon.Enco
 	return shards[content_n:]
 }
 
-type dec_group struct {
+type DecGroup struct {
 	content_n uint16
 	content_m uint16
 	parity_m  uint16
 	parity_l  uint16
 
-	last_active time.Time
-	finished    bool
+	t        time.Time
+	finished bool
 
 	shards [][]byte
 	sent   []bool
 }
 
-func (s *dec_group) decode_packet(b []byte, fec []uint16) ([]byte, error) {
+func (s *DecGroup) decode_packet(b []byte, fec []uint16) ([]byte, error) {
 	if len(b) < 6 {
 		return nil, fmt.Errorf("packet too small: %d < 6", len(b))
 	}
@@ -151,21 +151,25 @@ func (s *dec_group) decode_packet(b []byte, fec []uint16) ([]byte, error) {
 
 		return s.shards[i], nil
 	} else {
-		s.parity_m += 1
+		if s.parity_l != 0 && s.parity_l != uint16(len(s.shards[i])) {
+			return nil, fmt.Errorf("mismatch parity length: %d != %d", s.parity_l, uint16(len(s.shards[i])))
+		}
+
 		s.parity_l = uint16(len(s.shards[i]))
+		s.parity_m += 1
 
 		return nil, nil
 	}
 }
 
-func (s *dec_group) reconstruct(parity_n uint16, encoder reedsolomon.Encoder) ([][]byte, error) {
+func (s *DecGroup) reconstruct(parity_n uint16, encoder reedsolomon.Encoder) ([][]byte, error) {
 	if s.content_m+s.parity_m < s.content_n {
-		return nil, fmt.Errorf("")
+		return nil, nil
 	}
 
 	for i := range s.shards[:s.content_n] {
 		if uint16(len(s.shards[i])) > s.parity_l {
-			return nil, fmt.Errorf("content length greater than parity length")
+			return nil, fmt.Errorf("content length greater than parity length: %d > %d", uint16(len(s.shards[i])), s.parity_l)
 		}
 	}
 
@@ -187,6 +191,10 @@ func (s *dec_group) reconstruct(parity_n uint16, encoder reedsolomon.Encoder) ([
 		r = bytes.NewReader(s.shards[i][len(s.shards[i])-2:])
 
 		binary.Read(r, binary.BigEndian, &l)
+
+		if l > uint16(len(s.shards[i])) {
+			return nil, fmt.Errorf("content indicated length greater than actual :%d > %d", l, uint16(len(s.shards[i])))
+		}
 		s.shards[i] = s.shards[i][:l]
 	}
 

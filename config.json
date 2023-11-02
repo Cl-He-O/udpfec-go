@@ -2,7 +2,8 @@
   "is_server": false,
   "listen": "127.0.0.1:12222",
   "forward": "127.0.0.1:12223",
-  "timeout": 20,
+  "timeout": 15,
+  "conn_timeout": 60000,
   "group_live": 10000,
   "fec": [
     1,

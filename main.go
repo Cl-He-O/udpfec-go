@@ -4,25 +4,31 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"net"
-	"net/netip"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
+	"github.com/sagernet/sing/common/control"
 )
 
 type Config struct {
-	Listen    string   `json:"listen"`
-	Forward   string   `json:"forward"`
-	IsServer  bool     `json:"is_server"`
-	Timeout   int      `json:"timeout"`
-	GroupLive int      `json:"group_live"`
-	Fec       []uint16 `json:"fec"`
+	Listen      string   `json:"listen"`
+	Forward     string   `json:"forward"`
+	Interface   string   `json:"iface"`
+	IsServer    bool     `json:"is_server"`
+	Timeout     int      `json:"timeout"`
+	ConnTimeout int      `json:"conn_timeout"`
+	GroupLive   int      `json:"group_live"`
+	Fec         []uint16 `json:"fec"`
+
+	encoders []reedsolomon.Encoder
 }
 
-func udpAddr(addr string) *net.UDPAddr {
+func udp_addr(addr string) *net.UDPAddr {
 	udpaddr, err := net.ResolveUDPAddr("udp", addr)
 
 	if err != nil {
@@ -31,8 +37,21 @@ func udpAddr(addr string) *net.UDPAddr {
 	return udpaddr
 }
 
-func encode(enc chan []byte, write_packet func([]byte, bool), config Config, encoders []reedsolomon.Encoder) {
+type WriteConn struct {
+	*net.UDPConn
+	*net.UDPAddr
+}
 
+func (s *WriteConn) Write(b []byte) (n int, err error) {
+	if s.UDPAddr != nil {
+		return s.UDPConn.WriteToUDP(b, s.UDPAddr)
+	} else if s.UDPConn != nil {
+		return s.UDPConn.Write(b)
+	}
+	return 0, nil
+}
+
+func encode(enc chan []byte, out WriteConn, config *Config) {
 	var (
 		shards   [][]byte = make([][]byte, 0)
 		id       uint32   = rand.Uint32()
@@ -43,11 +62,16 @@ func encode(enc chan []byte, write_packet func([]byte, bool), config Config, enc
 
 	for {
 		select {
-		case b := <-enc:
+		case b, ok := <-enc:
+			if !ok {
+				cancel()
+				return
+			}
+
 			shards = append(shards, b)
 			b = encode_packet(shards, id, len(shards)-1)
 
-			write_packet(b, false)
+			out.Write(b)
 
 			is_final = len(shards) == len(config.Fec)
 		case <-ctx.Done():
@@ -57,11 +81,13 @@ func encode(enc chan []byte, write_packet func([]byte, bool), config Config, enc
 			is_final = true
 		}
 
+		//fmt.Printf("%d\n", id)
+
 		if is_final {
-			parity := final(shards, id, config.Fec[len(shards)-1], encoders[len(shards)-1])
+			parity := final(shards, id, config.Fec[len(shards)-1], config.encoders[len(shards)-1])
 
 			for i := range parity {
-				write_packet(parity[i], false)
+				out.Write(parity[i])
 			}
 
 			shards = make([][]byte, 0)
@@ -75,43 +101,45 @@ func encode(enc chan []byte, write_packet func([]byte, bool), config Config, enc
 	}
 }
 
-func decode(dec chan []byte, write_packet func([]byte, bool), config Config, encoders []reedsolomon.Encoder) {
-	groups := make(map[uint32]*dec_group)
+func decode(dec chan []byte, out WriteConn, config *Config) {
+	groups := sync.Map{}
 
 	// GC
 	go func() {
 		for {
 			now := time.Now()
-			u := time.Time{}
 
-			for i := range groups {
-				if groups[i].last_active != u {
-					if groups[i].last_active.Add(time.Duration(config.GroupLive) * time.Millisecond).Before(now) {
-						//fmt.Printf("GC: group %x cleared\n", i)
-						delete(groups, i)
-					}
+			groups.Range(func(key, value any) bool {
+				if value.(*DecGroup).t.Add(time.Duration(config.GroupLive) * time.Millisecond).Before(now) {
+					groups.Delete(key)
 				}
-			}
+
+				return true
+			})
 
 			time.Sleep(time.Second)
 		}
 	}()
 
 	for {
-		b := <-dec
+		b, ok := <-dec
+		if !ok {
+			return
+		}
 
 		id, err := read_id(b)
 		if err != nil {
-			fmt.Printf("%s\n", err)
+			slog.Warn(err.Error())
 			continue
 		}
 
-		// fmt.Printf("id: %x\n", id)
+		//fmt.Printf("id: %x\n", id)
 
-		if _, ok := groups[id]; !ok {
-			groups[id] = &dec_group{}
+		if _, ok := groups.Load(id); !ok {
+			groups.Store(id, &DecGroup{t: time.Now()})
 		}
-		group := groups[id]
+		value, _ := groups.Load(id)
+		group := value.(*DecGroup)
 
 		if group.finished {
 			continue
@@ -119,37 +147,44 @@ func decode(dec chan []byte, write_packet func([]byte, bool), config Config, enc
 
 		b, err = group.decode_packet(b, config.Fec)
 		if err != nil {
-			fmt.Printf("%s\n", err)
+			slog.Warn(err.Error())
 			continue
 		}
 
-		group.last_active = time.Now()
-
 		if b != nil {
-			write_packet(b, true)
+			out.Write(b)
 			continue
 		}
 
 		if group.content_n != 0 {
 			if group.content_m == group.content_n {
-				fmt.Printf("finished group %x\n", id)
+				//fmt.Printf("finished group %x\n", id)
 				group.finished = true
 				continue
 			}
 
-			if data, err := group.reconstruct(config.Fec[group.content_n-1], encoders[group.content_n-1]); err == nil {
-				fmt.Printf("reconstructed group %x\n", id)
+			if data, err := group.reconstruct(config.Fec[group.content_n-1], config.encoders[group.content_n-1]); err == nil {
+				if data == nil {
+					continue
+				}
+
+				//fmt.Printf("reconstructed group %x\n", id)
 				for i := range data {
 					if i >= len(group.sent) || !group.sent[i] {
-						write_packet(data[i], true)
+						out.Write(data[i])
 					}
 				}
 				group.finished = true
 			} else {
-				fmt.Printf("%s\n", err)
+				slog.Warn(err.Error())
 			}
 		}
 	}
+}
+
+type Conn struct {
+	c           chan []byte
+	last_active time.Time
 }
 
 func main() {
@@ -165,84 +200,129 @@ func main() {
 		panic(err)
 	}
 
-	listen, err := net.ListenUDP("udp", udpAddr(config.Listen))
+	listen, err := net.ListenUDP("udp", udp_addr(config.Listen))
 
 	if err != nil {
 		panic(err)
 	}
 
-	encoders := make([]reedsolomon.Encoder, len(config.Fec))
-	for i := range encoders {
-		encoders[i], err = reedsolomon.New(i+1, int(config.Fec[i]))
+	bind := func(conn *net.UDPConn) error {
+		return nil
+	}
+
+	var laddr *net.UDPAddr = nil
+
+	if config.Interface != "" {
+		iface, err := net.InterfaceByName(config.Interface)
+		if err != nil {
+			panic(err)
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			panic(err)
+		}
+		laddr = &net.UDPAddr{IP: addrs[0].(*net.IPNet).IP}
+
+		bindfunc := control.BindToInterface(control.DefaultInterfaceFinder(), config.Interface, -1)
+		bind = func(conn *net.UDPConn) error {
+			rawconn, err := conn.SyscallConn()
+			if err != nil {
+				panic(err)
+			}
+
+			return bindfunc("udp", "", rawconn)
+		}
+	}
+
+	config.encoders = make([]reedsolomon.Encoder, len(config.Fec))
+	for i := range config.encoders {
+		config.encoders[i], err = reedsolomon.New(i+1, int(config.Fec[i]))
 		if err != nil {
 			panic(err)
 		}
 	}
 
-	var (
-		from netip.AddrPort
-		prev chan []byte
-		next chan []byte
-	)
+	conns := sync.Map{}
 
-	enc := make(chan []byte)
-	dec := make(chan []byte)
-
-	prev, next = enc, dec
-	if config.IsServer {
-		prev, next = dec, enc
-	}
-
-	forward, err := net.DialUDP("udp", nil, udpAddr(config.Forward))
-	if err != nil {
-		panic(err)
-	}
+	// GC
 	go func() {
 		for {
-			buf := make([]byte, BufSize)
+			now := time.Now()
 
-			n, _, err := forward.ReadFromUDPAddrPort(buf)
+			conns.Range(func(key, value any) bool {
+				if value.(*Conn).last_active.Add(time.Duration(config.ConnTimeout) * time.Millisecond).Before(now) {
+					value.(*Conn).c = nil
+					conns.Delete(key)
+				}
 
-			if err != nil {
-				fmt.Printf("%s\n", err)
-				continue
-			}
+				return true
+			})
 
-			next <- buf[:n]
+			time.Sleep(time.Second)
 		}
 	}()
 
-	write_packet := func(b []byte, isDec bool) {
-		go func() {
-			if config.IsServer == isDec {
-				_, err := forward.Write(b)
-				if err != nil {
-					fmt.Printf("%s\n", err)
-				}
-			} else {
-				_, err := listen.WriteToUDPAddrPort(b, from)
-				if err != nil {
-					fmt.Printf("%s\n", err)
-				}
-			}
-		}()
-	}
-
-	go encode(enc, write_packet, config, encoders)
-	go decode(dec, write_packet, config, encoders)
-
-	var (
-		n int
-	)
-
 	for {
-		b := make([]byte, BufSize)
-		n, from, err = listen.ReadFromUDPAddrPort(b)
+		b := make([]byte, buf_size)
+		n, from, err := listen.ReadFromUDP(b)
 
 		if err != nil {
 			panic(err)
 		}
 
-		prev <- b[:n]
+		if value, ok := conns.Load(from.AddrPort()); !ok {
+			slog.Info(fmt.Sprintf("new connection from %s", from))
+
+			conn := &Conn{make(chan []byte), time.Now()}
+			conns.Store(from.AddrPort(), conn)
+
+			remote := make(chan []byte)
+
+			go func() {
+				forward, err := net.DialUDP("udp", laddr, udp_addr(config.Forward))
+
+				defer func() {
+					remote = nil
+					conn.c = nil
+					conns.Delete(from.AddrPort())
+				}()
+
+				if err != nil {
+					slog.Warn(err.Error())
+					return
+				}
+
+				bind(forward)
+
+				if config.IsServer {
+					go encode(remote, WriteConn{listen, from}, &config)
+					go decode(conn.c, WriteConn{forward, nil}, &config)
+				} else {
+					go encode(conn.c, WriteConn{forward, nil}, &config)
+					go decode(remote, WriteConn{listen, from}, &config)
+				}
+
+				for {
+					forward.SetReadDeadline(time.Now().Add(time.Duration(config.ConnTimeout) * time.Millisecond))
+
+					b := make([]byte, buf_size)
+					n, err := forward.Read(b)
+
+					if err != nil {
+						slog.Warn(err.Error())
+
+						return
+					}
+
+					conn.last_active = time.Now()
+					remote <- b[:n]
+				}
+			}()
+
+			conn.c <- b[:n]
+		} else {
+			value.(*Conn).c <- b[:n]
+		}
 	}
 }
