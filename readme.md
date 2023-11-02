@@ -1,6 +1,6 @@
 This is a tool for reducing packet lost designed for gaming purpose.
 
-Neither encryption nor authentication are implemented as the intended use case - tunneling udp-based proxy/VPN - already include those security features.
+Neither encryption nor authentication is implemented, as the intended use case - tunneling udp-based proxy/VPN - already include those security features.
 
 Obfuscation is planned.
 
