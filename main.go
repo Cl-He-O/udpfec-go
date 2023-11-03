@@ -278,24 +278,23 @@ func main() {
 
 	conns := make(map[netip.AddrPort]*Conn)
 	conns_lock := &sync.Mutex{}
+	last_gc := time.Now()
 
-	// GC
-	go func() {
-		for {
-			now := time.Now()
-
+	for {
+		// GC
+		now := time.Now()
+		if last_gc.Add(time.Duration(config.GCInterval) * time.Millisecond).Before(now) {
+			conns_lock.Lock()
 			for i := range conns {
 				if conns[i].last_active.Add(time.Duration(config.ConnTimeout) * time.Millisecond).Before(now) {
 					close(conns[i].c)
 					delete(conns, i)
 				}
 			}
-
-			time.Sleep(time.Duration(config.GCInterval) * time.Millisecond)
+			conns_lock.Unlock()
+			last_gc = now
 		}
-	}()
 
-	for {
 		b := make([]byte, buf_size)
 		n, from, err := listen.ReadFromUDP(b)
 
