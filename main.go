@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"time"
@@ -15,15 +16,23 @@ import (
 	"github.com/sagernet/sing/common/control"
 )
 
+var (
+	logger *slog.Logger
+)
+
 type Config struct {
-	Listen      string   `json:"listen"`
-	Forward     string   `json:"forward"`
-	Interface   string   `json:"iface"`
-	IsServer    bool     `json:"is_server"`
+	IsServer bool   `json:"is_server"`
+	LogLevel string `json:"log_level"`
+
+	Listen    string `json:"listen"`
+	Forward   string `json:"forward"`
+	Interface string `json:"iface"`
+
 	Timeout     int      `json:"timeout"`
 	ConnTimeout int      `json:"conn_timeout"`
 	GroupLive   int      `json:"group_live"`
 	Fec         []uint16 `json:"fec"`
+	GCInterval  int      `json:"gc_interval"`
 
 	encoders []reedsolomon.Encoder
 }
@@ -53,11 +62,11 @@ func (s *WriteConn) Write(b []byte) (n int, err error) {
 
 func encode(enc chan []byte, out WriteConn, config *Config) {
 	var (
-		shards   [][]byte = make([][]byte, 0)
-		id       uint32   = rand.Uint32()
-		is_final bool
-		ctx      context.Context = context.Background()
-		cancel   context.CancelFunc
+		shards   [][]byte           = make([][]byte, 0)
+		id       uint32             = rand.Uint32()
+		is_final bool               = false
+		ctx      context.Context    = context.Background()
+		cancel   context.CancelFunc = func() {}
 	)
 
 	for {
@@ -81,7 +90,7 @@ func encode(enc chan []byte, out WriteConn, config *Config) {
 			is_final = true
 		}
 
-		//fmt.Printf("%d\n", id)
+		logger.Debug(fmt.Sprintf("encode: %x", id))
 
 		if is_final {
 			parity := final(shards, id, config.Fec[len(shards)-1], config.encoders[len(shards)-1])
@@ -102,26 +111,22 @@ func encode(enc chan []byte, out WriteConn, config *Config) {
 }
 
 func decode(dec chan []byte, out WriteConn, config *Config) {
-	groups := sync.Map{}
-
-	// GC
-	go func() {
-		for {
-			now := time.Now()
-
-			groups.Range(func(key, value any) bool {
-				if value.(*DecGroup).t.Add(time.Duration(config.GroupLive) * time.Millisecond).Before(now) {
-					groups.Delete(key)
-				}
-
-				return true
-			})
-
-			time.Sleep(time.Second)
-		}
-	}()
+	groups := make(map[uint32]*DecGroup)
+	last_gc := time.Now()
 
 	for {
+		// GC
+		now := time.Now()
+		if last_gc.Add(time.Duration(config.GCInterval) * time.Millisecond).Before(now) {
+			for i := range groups {
+				if groups[i].t.Add(time.Duration(config.GroupLive) * time.Millisecond).Before(now) {
+					delete(groups, i)
+				}
+			}
+
+			last_gc = now
+		}
+
 		b, ok := <-dec
 		if !ok {
 			return
@@ -129,17 +134,16 @@ func decode(dec chan []byte, out WriteConn, config *Config) {
 
 		id, err := read_id(b)
 		if err != nil {
-			slog.Warn(err.Error())
+			logger.Warn(err.Error())
 			continue
 		}
 
-		//fmt.Printf("id: %x\n", id)
+		logger.Debug(fmt.Sprintf("decode: %x", id))
 
-		if _, ok := groups.Load(id); !ok {
-			groups.Store(id, &DecGroup{t: time.Now()})
+		if _, ok := groups[id]; !ok {
+			groups[id] = &DecGroup{t: time.Now()}
 		}
-		value, _ := groups.Load(id)
-		group := value.(*DecGroup)
+		group := groups[id]
 
 		if group.finished {
 			continue
@@ -147,7 +151,7 @@ func decode(dec chan []byte, out WriteConn, config *Config) {
 
 		b, err = group.decode_packet(b, config.Fec)
 		if err != nil {
-			slog.Warn(err.Error())
+			logger.Warn(err.Error())
 			continue
 		}
 
@@ -158,7 +162,7 @@ func decode(dec chan []byte, out WriteConn, config *Config) {
 
 		if group.content_n != 0 {
 			if group.content_m == group.content_n {
-				//fmt.Printf("finished group %x\n", id)
+				logger.Debug(fmt.Sprintf("finished: %x", id))
 				group.finished = true
 				continue
 			}
@@ -168,7 +172,7 @@ func decode(dec chan []byte, out WriteConn, config *Config) {
 					continue
 				}
 
-				//fmt.Printf("reconstructed group %x\n", id)
+				logger.Debug(fmt.Sprintf("reconstructed: %x", id))
 				for i := range data {
 					if i >= len(group.sent) || !group.sent[i] {
 						out.Write(data[i])
@@ -176,7 +180,7 @@ func decode(dec chan []byte, out WriteConn, config *Config) {
 				}
 				group.finished = true
 			} else {
-				slog.Warn(err.Error())
+				logger.Warn(err.Error())
 			}
 		}
 	}
@@ -200,8 +204,26 @@ func main() {
 		panic(err)
 	}
 
-	listen, err := net.ListenUDP("udp", udp_addr(config.Listen))
+	if config.Timeout == 0 {
+		config.Timeout = 15
+	}
+	if config.ConnTimeout == 0 {
+		config.ConnTimeout = 30000
+	}
+	if config.GroupLive == 0 {
+		config.GroupLive = 5000
+	}
+	if config.GCInterval == 0 {
+		config.GCInterval = 5000
+	}
 
+	level := slog.LevelWarn
+	if config.LogLevel != "" {
+		level.UnmarshalText([]byte(config.LogLevel))
+	}
+	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+
+	listen, err := net.ListenUDP("udp", udp_addr(config.Listen))
 	if err != nil {
 		panic(err)
 	}
@@ -222,7 +244,18 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		laddr = &net.UDPAddr{IP: addrs[0].(*net.IPNet).IP}
+
+		for i := range addrs {
+			if addrs[i].(*net.IPNet).IP.IsGlobalUnicast() {
+				laddr = &net.UDPAddr{IP: addrs[i].(*net.IPNet).IP}
+				logger.Debug("laddr: " + laddr.String())
+				break
+			}
+		}
+
+		if laddr == nil {
+			panic(fmt.Errorf("no valid addrs found on the interface"))
+		}
 
 		bindfunc := control.BindToInterface(control.DefaultInterfaceFinder(), config.Interface, -1)
 		bind = func(conn *net.UDPConn) error {
@@ -243,23 +276,22 @@ func main() {
 		}
 	}
 
-	conns := sync.Map{}
+	conns := make(map[netip.AddrPort]*Conn)
+	conns_lock := &sync.Mutex{}
 
 	// GC
 	go func() {
 		for {
 			now := time.Now()
 
-			conns.Range(func(key, value any) bool {
-				if value.(*Conn).last_active.Add(time.Duration(config.ConnTimeout) * time.Millisecond).Before(now) {
-					value.(*Conn).c = nil
-					conns.Delete(key)
+			for i := range conns {
+				if conns[i].last_active.Add(time.Duration(config.ConnTimeout) * time.Millisecond).Before(now) {
+					close(conns[i].c)
+					delete(conns, i)
 				}
+			}
 
-				return true
-			})
-
-			time.Sleep(time.Second)
+			time.Sleep(time.Duration(config.GCInterval) * time.Millisecond)
 		}
 	}()
 
@@ -271,11 +303,13 @@ func main() {
 			panic(err)
 		}
 
-		if value, ok := conns.Load(from.AddrPort()); !ok {
-			slog.Info(fmt.Sprintf("new connection from %s", from))
+		var conn *Conn
+		conns_lock.Lock()
+		if value, ok := conns[from.AddrPort()]; !ok {
+			logger.Info("new connection: " + from.String())
 
-			conn := &Conn{make(chan []byte), time.Now()}
-			conns.Store(from.AddrPort(), conn)
+			conn = &Conn{c: make(chan []byte), last_active: time.Now()}
+			conns[from.AddrPort()] = conn
 
 			remote := make(chan []byte)
 
@@ -283,13 +317,16 @@ func main() {
 				forward, err := net.DialUDP("udp", laddr, udp_addr(config.Forward))
 
 				defer func() {
-					remote = nil
-					conn.c = nil
-					conns.Delete(from.AddrPort())
+					close(remote)
+
+					conns_lock.Lock()
+					close(conn.c)
+					delete(conns, from.AddrPort())
+					conns_lock.Unlock()
 				}()
 
 				if err != nil {
-					slog.Warn(err.Error())
+					logger.Warn(err.Error())
 					return
 				}
 
@@ -310,19 +347,23 @@ func main() {
 					n, err := forward.Read(b)
 
 					if err != nil {
-						slog.Warn(err.Error())
-
+						if e, ok := err.(net.Error); ok && e.Timeout() {
+							logger.Info(err.Error())
+						} else {
+							logger.Warn(err.Error())
+						}
 						return
 					}
 
 					conn.last_active = time.Now()
+
 					remote <- b[:n]
 				}
 			}()
-
-			conn.c <- b[:n]
 		} else {
-			value.(*Conn).c <- b[:n]
+			conn = value
 		}
+		conn.c <- b[:n]
+		conns_lock.Unlock()
 	}
 }
